@@ -174,126 +174,126 @@ static bool process_directory_recursive(ExfatContext* ctx, uint32_t start_cluste
         return true;
     }
 
-    uint32_t current_cluster = start_cluster;
-    uint32_t cluster_count = 0;
-    bool finished = false;
+    uint32_t total_clusters = 0;
+    uint32_t cluster = start_cluster;
+    while (cluster != 0 && total_clusters < ctx->boot_sector.cluster_count) {
+        total_clusters++;
+        cluster = get_next_cluster(ctx, cluster);
+    }
+    if (total_clusters == 0) return true;
 
-    while (!finished && current_cluster != 0) {
-        if (++cluster_count > ctx->boot_sector.cluster_count) break;
-        if (!read_cluster(ctx, current_cluster, ctx->cluster_buf)) {
+    uint64_t total_size = (uint64_t)total_clusters * ctx->bytes_per_cluster;
+    uint8_t* dir_buf = malloc((size_t)total_size);
+    if (!dir_buf) return false;
+
+    cluster = start_cluster;
+    for (uint32_t c = 0; c < total_clusters; c++) {
+        if (cluster == 0) { free(dir_buf); return false; }
+        uint64_t offset = get_cluster_offset(ctx, cluster);
+        if (!exfat_read(ctx, dir_buf + (uint64_t)c * ctx->bytes_per_cluster, offset, ctx->bytes_per_cluster)) {
+            free(dir_buf);
             return false;
         }
+        cluster = get_next_cluster(ctx, cluster);
+    }
 
-        uint32_t entries_per_cluster = ctx->bytes_per_cluster / EXFAT_ENTRY_SIZE;
-        uint32_t entry_offset = 0;
-        for (uint32_t i = 0; i < entries_per_cluster; ) {
-            uint8_t* entry_ptr = ctx->cluster_buf + entry_offset;
-            uint8_t entry_type = *entry_ptr;
-            if (entry_type == EXFAT_ENTRY_EOD) {
-                finished = true;
-                break;
-            }
+    uint32_t total_entries = (uint32_t)(total_size / EXFAT_ENTRY_SIZE);
+    uint32_t idx = 0;
 
-            if (entry_type == EXFAT_ENTRY_FILE) {
-                if (entry_offset + EXFAT_ENTRY_SIZE * 2 > ctx->bytes_per_cluster) {
-                    i++; entry_offset += EXFAT_ENTRY_SIZE; continue;
-                }
-                ExfatFileEntry* file_entry = (ExfatFileEntry*)entry_ptr;
-                ExfatStreamEntry* stream_entry = (ExfatStreamEntry*)(entry_ptr + EXFAT_ENTRY_SIZE);
-                if (stream_entry->entry_type != EXFAT_ENTRY_STREAM) {
-                    i++;
-                    entry_offset += EXFAT_ENTRY_SIZE;
-                    continue;
-                }
-                int total_name_chars = stream_entry->name_length;
-                int num_name_entries = (total_name_chars + 14) / 15;
+    while (idx < total_entries) {
+        uint8_t* entry_ptr = dir_buf + (uint64_t)idx * EXFAT_ENTRY_SIZE;
+        uint8_t entry_type = *entry_ptr;
 
-                if (entry_offset + EXFAT_ENTRY_SIZE * (2 + num_name_entries) > ctx->bytes_per_cluster) {
-                    i++; entry_offset += EXFAT_ENTRY_SIZE; continue;
-                }
+        if (entry_type == EXFAT_ENTRY_EOD) break;
 
-                char full_name[MAX_FILENAME_LENGTH];
-                uint16_t full_name_unicode[MAX_FILENAME_LENGTH];
-                int pos = 0;
-                uint8_t* name_entry_ptr = entry_ptr + EXFAT_ENTRY_SIZE * 2;
-                for (int k = 0; k < num_name_entries; k++) {
-                    ExfatFileNameEntry* name_entry = (ExfatFileNameEntry*)(name_entry_ptr + k * EXFAT_ENTRY_SIZE);
-                    int chars_in_this_entry = (total_name_chars - k * 15 < 15) ? (total_name_chars - k * 15) : 15;
-                    for (int j = 0; j < chars_in_this_entry; j++) {
-                        if (pos < MAX_FILENAME_LENGTH - 1) {
-                            full_name_unicode[pos++] = name_entry->file_name[j];
-                        }
-                    }
-                }
-                full_name_unicode[pos] = 0;
+        if (entry_type == EXFAT_ENTRY_FILE) {
+            if (idx + 2 > total_entries) { idx++; continue; }
 
-                fs_name_to_utf8(full_name_unicode, pos, full_name, sizeof(full_name));
-
-                ExfatFileInfo file_info;
-                memset(&file_info, 0, sizeof(file_info));
-                strncpy(file_info.name, full_name, MAX_PATH_LENGTH - 1);
-                file_info.name[MAX_PATH_LENGTH - 1] = '\0';
-                if (file_entry->file_attributes & 0x04) {
-                    int total_entries = 2 + num_name_entries;
-                    i += total_entries;
-                    entry_offset += EXFAT_ENTRY_SIZE * total_entries;
-                    continue;
-                }
-
-                file_info.first_cluster = stream_entry->first_cluster;
-                file_info.data_length = stream_entry->data_length;
-                file_info.is_directory = ((file_entry->file_attributes & 0x10) != 0);
-                file_info.no_fat_chain = ((stream_entry->flags & 0x02) != 0);
-                file_info.modify_timestamp = file_entry->last_modified_timestamp;
-                file_info.access_timestamp = file_entry->last_access_timestamp;
-                file_info.modify_10ms = file_entry->last_modified_10ms;
-                file_info.modify_utc_offset = (int8_t)file_entry->last_modified_utc_offset;
-                file_info.access_utc_offset = (int8_t)file_entry->last_access_utc_offset;
-
-                char full_path[MAX_PATH_LENGTH];
-                if (!combine_path(full_path, sizeof(full_path), output_dir, file_info.name)) {
-                    fprintf(stderr, "path:%s\n", file_info.name);
-                    continue;
-                }
-
-                int total_entries = 2 + num_name_entries;
-                i += total_entries;
-                entry_offset += EXFAT_ENTRY_SIZE * total_entries;
-
-                if (file_info.is_directory) {
-                    if (create_directories(full_path)) {
-                        process_directory_recursive(ctx, file_info.first_cluster, full_path, depth + 1);
-                        if (file_info.modify_timestamp != 0) {
-                            if (ctx->deferred_count >= ctx->deferred_capacity)
-                                grow_deferred_dirs(&ctx->deferred_dirs, &ctx->deferred_capacity);
-                            if (ctx->deferred_count < ctx->deferred_capacity) {
-                                DeferredDirTime* d = &ctx->deferred_dirs[ctx->deferred_count++];
-                                STRCPY_S(d->path, sizeof(d->path), full_path);
-                                d->mtime = exfat_timestamp_to_ntfs(file_info.modify_timestamp, file_info.modify_10ms, file_info.modify_utc_offset);
-                                d->atime = exfat_timestamp_to_ntfs(file_info.access_timestamp, 0, file_info.access_utc_offset);
-                            }
-                        }
-                        if (!read_cluster(ctx, current_cluster, ctx->cluster_buf)) {
-                            return false;
-                        }
-                    }
-                }
-                else {
-                    extract_file(ctx, &file_info, full_path);
-                }
+            ExfatFileEntry* file_entry = (ExfatFileEntry*)entry_ptr;
+            ExfatStreamEntry* stream_entry = (ExfatStreamEntry*)(entry_ptr + EXFAT_ENTRY_SIZE);
+            if (stream_entry->entry_type != EXFAT_ENTRY_STREAM) {
+                idx++;
                 continue;
             }
-            else {
-                i++;
-                entry_offset += EXFAT_ENTRY_SIZE;
-            }
-        }
 
-        if (!finished) {
-            current_cluster = get_next_cluster(ctx, current_cluster);
+            int total_name_chars = stream_entry->name_length;
+            int num_name_entries = (total_name_chars + 14) / 15;
+            int set_size = 2 + num_name_entries;
+
+            if (idx + set_size > total_entries) { idx++; continue; }
+
+            char full_name[MAX_FILENAME_LENGTH];
+            uint16_t full_name_unicode[MAX_FILENAME_LENGTH];
+            int pos = 0;
+            uint8_t* name_entry_ptr = entry_ptr + EXFAT_ENTRY_SIZE * 2;
+            for (int k = 0; k < num_name_entries; k++) {
+                ExfatFileNameEntry* name_entry = (ExfatFileNameEntry*)(name_entry_ptr + k * EXFAT_ENTRY_SIZE);
+                int chars_in_this_entry = (total_name_chars - k * 15 < 15) ? (total_name_chars - k * 15) : 15;
+                for (int j = 0; j < chars_in_this_entry; j++) {
+                    if (pos < MAX_FILENAME_LENGTH - 1) {
+                        full_name_unicode[pos++] = name_entry->file_name[j];
+                    }
+                }
+            }
+            full_name_unicode[pos] = 0;
+
+            fs_name_to_utf8(full_name_unicode, pos, full_name, sizeof(full_name));
+
+            ExfatFileInfo file_info;
+            memset(&file_info, 0, sizeof(file_info));
+            strncpy(file_info.name, full_name, MAX_PATH_LENGTH - 1);
+            file_info.name[MAX_PATH_LENGTH - 1] = '\0';
+
+            if (file_entry->file_attributes & 0x04) {
+                idx += set_size;
+                continue;
+            }
+
+            file_info.first_cluster = stream_entry->first_cluster;
+            file_info.data_length = stream_entry->data_length;
+            file_info.is_directory = ((file_entry->file_attributes & 0x10) != 0);
+            file_info.no_fat_chain = ((stream_entry->flags & 0x02) != 0);
+            file_info.modify_timestamp = file_entry->last_modified_timestamp;
+            file_info.access_timestamp = file_entry->last_access_timestamp;
+            file_info.modify_10ms = file_entry->last_modified_10ms;
+            file_info.modify_utc_offset = (int8_t)file_entry->last_modified_utc_offset;
+            file_info.access_utc_offset = (int8_t)file_entry->last_access_utc_offset;
+
+            char full_path[MAX_PATH_LENGTH];
+            if (!combine_path(full_path, sizeof(full_path), output_dir, file_info.name)) {
+                fprintf(stderr, "path:%s\n", file_info.name);
+                idx += set_size;
+                continue;
+            }
+
+            idx += set_size;
+
+            if (file_info.is_directory) {
+                if (create_directories(full_path)) {
+                    process_directory_recursive(ctx, file_info.first_cluster, full_path, depth + 1);
+                    if (file_info.modify_timestamp != 0) {
+                        if (ctx->deferred_count >= ctx->deferred_capacity)
+                            grow_deferred_dirs(&ctx->deferred_dirs, &ctx->deferred_capacity);
+                        if (ctx->deferred_count < ctx->deferred_capacity) {
+                            DeferredDirTime* d = &ctx->deferred_dirs[ctx->deferred_count++];
+                            STRCPY_S(d->path, sizeof(d->path), full_path);
+                            d->mtime = exfat_timestamp_to_ntfs(file_info.modify_timestamp, file_info.modify_10ms, file_info.modify_utc_offset);
+                            d->atime = exfat_timestamp_to_ntfs(file_info.access_timestamp, 0, file_info.access_utc_offset);
+                        }
+                    }
+                }
+            }
+            else {
+                extract_file(ctx, &file_info, full_path);
+            }
+            continue;
+        }
+        else {
+            idx++;
         }
     }
 
+    free(dir_buf);
     return true;
 }
 
